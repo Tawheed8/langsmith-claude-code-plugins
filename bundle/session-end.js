@@ -12666,8 +12666,9 @@ async function traceTurn(options) {
   let lastEndTime = turn.userTimestamp;
   for (const llmCall of turn.llmCalls) {
     const assistantContent = formatContent(llmCall.content);
+    const llmStartBoundary = lastEndTime;
     const assistantRunId = uuid7();
-    const assistantDottedOrderSegment = generateDottedOrderSegment(llmCall.startTime, assistantRunId);
+    const assistantDottedOrderSegment = generateDottedOrderSegment(llmStartBoundary, assistantRunId);
     const assistantDottedOrder = `${parentDottedOrder}.${assistantDottedOrderSegment}`;
     const assistantRunTree = new RunTree({
       client,
@@ -12677,7 +12678,7 @@ async function traceTurn(options) {
       run_type: "llm",
       inputs: { messages: [...accumulatedMessages] },
       project_name: project,
-      start_time: llmCall.startTime,
+      start_time: llmStartBoundary,
       parent_run_id: turnRunId,
       trace_id: traceId,
       dotted_order: assistantDottedOrder
@@ -12736,7 +12737,8 @@ async function traceTurn(options) {
       }
       lastEndTime = toolEndTime;
     }
-    const assistantEndTime = llmCall.toolCalls.length > 0 ? lastEndTime : llmCall.endTime;
+    const assistantEndTime = llmCall.endTime;
+    const nextBoundary = llmCall.toolCalls.length > 0 ? lastEndTime : llmCall.endTime;
     const runTree = new RunTree({
       client,
       replicas,
@@ -12747,7 +12749,7 @@ async function traceTurn(options) {
       parent_run_id: turnRunId,
       name: ASSISTANT_RUN_NAME,
       project_name: project,
-      start_time: llmCall.startTime,
+      start_time: llmStartBoundary,
       end_time: assistantEndTime,
       outputs: {
         messages: [{ role: "assistant", content: assistantContent }]
@@ -12767,6 +12769,10 @@ async function traceTurn(options) {
               model: llmCall.model
             },
             usage_metadata: buildUsageMetadata(llmCall.usage),
+            // First visible token, preserved now that it no longer drives
+            // start_time — lets duration be split into thinking (start_time →
+            // this) vs. streaming (this → end_time) after the fact.
+            ls_first_token_time: llmCall.startTime,
             ...llmCall.synthetic ? { synthetic: true } : {}
           }
         })
@@ -12781,7 +12787,7 @@ async function traceTurn(options) {
         content: [{ type: "text", text: tc.result?.content ?? "" }]
       });
     }
-    lastEndTime = assistantEndTime;
+    lastEndTime = nextBoundary;
   }
   if (shouldCreateTurn) {
     const turnOutputs = accumulatedMessages.filter((m) => m.role !== "user");
