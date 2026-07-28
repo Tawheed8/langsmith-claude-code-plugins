@@ -1152,8 +1152,11 @@ describe("traceTurn", () => {
     expect(chainPatches.length).toBe(1);
 
     // start_time must be set on patchRun to prevent the SDK from defaulting to Date.now()
-    // which would overwrite the correct start_time and cause negative durations
-    expect(llmPatches[0].params.start_time).toBe("2025-01-01T00:00:01Z");
+    // which would overwrite the correct start_time and cause negative durations.
+    // For this first-and-only LLM call, the true start boundary is the turn's
+    // userTimestamp (no prior tool result to anchor to) — NOT the model's first
+    // visible token (startTime), which would hide pre-output latency.
+    expect(llmPatches[0].params.start_time).toBe("2025-01-01T00:00:00Z");
     expect(chainPatches[0].params.start_time).toBe("2025-01-01T00:00:00Z");
   });
 
@@ -1221,11 +1224,15 @@ describe("traceTurn", () => {
     const llmPatches = patchInstances.filter((i) => i.params.run_type === "llm");
     expect(llmPatches.length).toBe(1);
 
-    // LLM patchRun must carry the original start_time to avoid negative durations
-    expect(llmPatches[0].params.start_time).toBe("2025-01-01T00:00:01Z");
+    // LLM patchRun must carry a start_time to avoid negative durations. This is
+    // the first LLM call in the turn, so its true start boundary is the turn's
+    // userTimestamp, not its own first visible token (startTime).
+    expect(llmPatches[0].params.start_time).toBe("2025-01-01T00:00:00Z");
 
-    // end_time should be the last tool result timestamp (tool calls present)
-    expect(llmPatches[0].params.end_time).toBe("2025-01-01T00:00:03Z");
+    // end_time is the model's own last streamed chunk, never stretched to cover
+    // tool execution — the tool result timestamp (00:00:03Z) belongs to the
+    // Read tool's own span, not this one.
+    expect(llmPatches[0].params.end_time).toBe("2025-01-01T00:00:02Z");
 
     // postRun instances should also have project_name set
     const postInstances = allRunTreeInstances.filter((i) => i.ops.includes("postRun"));

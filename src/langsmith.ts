@@ -282,10 +282,17 @@ export async function traceTurn(
   for (const llmCall of turn.llmCalls) {
     const assistantContent = formatContent(llmCall.content);
 
+    // True start of this LLM call: when the previous thing (a tool result, or the
+    // user's prompt for the first call) finished — NOT the model's first visible
+    // token. Anchoring on the first token hides all pre-output latency
+    // (thinking/TTFT/queueing) between the two; snapshot the boundary here,
+    // before the tool loop below advances `lastEndTime`, to recover that time.
+    const llmStartBoundary = lastEndTime;
+
     // Generate run ID for this LLM call
     const assistantRunId = uuid7();
     const assistantDottedOrderSegment = generateDottedOrderSegment(
-      llmCall.startTime,
+      llmStartBoundary,
       assistantRunId,
     );
     const assistantDottedOrder = `${parentDottedOrder}.${assistantDottedOrderSegment}`;
@@ -299,7 +306,7 @@ export async function traceTurn(
       run_type: "llm",
       inputs: { messages: [...accumulatedMessages] },
       project_name: project,
-      start_time: llmCall.startTime,
+      start_time: llmStartBoundary,
       parent_run_id: turnRunId,
       trace_id: traceId,
       dotted_order: assistantDottedOrder,
@@ -377,8 +384,15 @@ export async function traceTurn(
       lastEndTime = toolEndTime;
     }
 
-    // Complete the assistant run.
-    const assistantEndTime = llmCall.toolCalls.length > 0 ? lastEndTime : llmCall.endTime;
+    // The model's own end time — always its last streamed chunk, never stretched
+    // over tool execution. Tools already get their own span (below/above); folding
+    // their time into this one as well double-counts it.
+    const assistantEndTime = llmCall.endTime;
+    // Boundary for the *next* iteration's llmStartBoundary: the last tool result
+    // if tools ran (lastEndTime was advanced by the tool loop above), otherwise
+    // this call's own end. Bookkeeping only — must not feed into this run's
+    // end_time above.
+    const nextBoundary = llmCall.toolCalls.length > 0 ? lastEndTime : llmCall.endTime;
     const runTree = new RunTree({
       client,
       replicas,
@@ -389,7 +403,7 @@ export async function traceTurn(
       parent_run_id: turnRunId,
       name: ASSISTANT_RUN_NAME,
       project_name: project,
-      start_time: llmCall.startTime,
+      start_time: llmStartBoundary,
       end_time: assistantEndTime,
       outputs: {
         messages: [{ role: "assistant", content: assistantContent }],
@@ -409,6 +423,10 @@ export async function traceTurn(
               model: llmCall.model,
             },
             usage_metadata: buildUsageMetadata(llmCall.usage),
+            // First visible token, preserved now that it no longer drives
+            // start_time — lets duration be split into thinking (start_time →
+            // this) vs. streaming (this → end_time) after the fact.
+            ls_first_token_time: llmCall.startTime,
             ...(llmCall.synthetic ? { synthetic: true } : {}),
           },
         }),
@@ -427,7 +445,7 @@ export async function traceTurn(
       });
     }
 
-    lastEndTime = assistantEndTime;
+    lastEndTime = nextBoundary;
   }
 
   // 4. Complete the turn run (only if we created it ourselves)
