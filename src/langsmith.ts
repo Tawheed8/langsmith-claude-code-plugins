@@ -423,10 +423,20 @@ export async function traceTurn(
               model: llmCall.model,
             },
             usage_metadata: buildUsageMetadata(llmCall.usage),
-            // First visible token, preserved now that it no longer drives
-            // start_time — lets duration be split into thinking (start_time →
-            // this) vs. streaming (this → end_time) after the fact.
+            // First streamed token, preserved now that it no longer drives
+            // start_time. Marks the end of pre-token latency (dispatch,
+            // queueing, prompt processing) and the start of model output.
             ls_first_token_time: llmCall.startTime,
+            // Thinking→generation boundary, when the response had one. Together
+            // with the two fields above this yields a three-way split:
+            //   pre-token  = ls_first_token_time - start_time
+            //   thinking   = ls_thinking_end_time - ls_first_token_time
+            //   generation = end_time - ls_thinking_end_time
+            // Omitted entirely when the response contained no thinking blocks,
+            // so a missing field means "no split available", never "zero".
+            ...(llmCall.thinkingEndTime
+              ? { ls_thinking_end_time: llmCall.thinkingEndTime }
+              : {}),
             ...(llmCall.synthetic ? { synthetic: true } : {}),
           },
         }),

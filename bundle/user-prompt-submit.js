@@ -12343,6 +12343,19 @@ function resolveProvider(model) {
     return "google_vertex_ai";
   return /^([a-z0-9-]+\.)?anthropic\.claude/.test(model) ? "amazon_bedrock" : "anthropic";
 }
+function findThinkingEndTime(chunks) {
+  let sawThinking = false;
+  for (const chunk of chunks) {
+    for (const block of chunk.message.content) {
+      if (block.type === "thinking") {
+        sawThinking = true;
+      } else if (sawThinking) {
+        return chunk.timestamp;
+      }
+    }
+  }
+  return void 0;
+}
 function mergeAssistantChunks(chunks) {
   if (chunks.length === 0) {
     throw new Error("Cannot merge zero chunks");
@@ -12357,7 +12370,8 @@ function mergeAssistantChunks(chunks) {
     usage: last.message.usage,
     // SSE usage is cumulative; last chunk has final totals.
     startTime: first.timestamp,
-    endTime: last.timestamp
+    endTime: last.timestamp,
+    thinkingEndTime: findThinkingEndTime(chunks)
   };
 }
 function mergeAdjacentTextBlocks(blocks) {
@@ -12431,6 +12445,7 @@ function groupIntoTurns(messages) {
         usage: merged.usage,
         startTime: merged.startTime,
         endTime: merged.endTime,
+        thinkingEndTime: merged.thinkingEndTime,
         toolCalls
       });
     }
@@ -12818,10 +12833,18 @@ async function traceTurn(options) {
               model: llmCall.model
             },
             usage_metadata: buildUsageMetadata(llmCall.usage),
-            // First visible token, preserved now that it no longer drives
-            // start_time — lets duration be split into thinking (start_time →
-            // this) vs. streaming (this → end_time) after the fact.
+            // First streamed token, preserved now that it no longer drives
+            // start_time. Marks the end of pre-token latency (dispatch,
+            // queueing, prompt processing) and the start of model output.
             ls_first_token_time: llmCall.startTime,
+            // Thinking→generation boundary, when the response had one. Together
+            // with the two fields above this yields a three-way split:
+            //   pre-token  = ls_first_token_time - start_time
+            //   thinking   = ls_thinking_end_time - ls_first_token_time
+            //   generation = end_time - ls_thinking_end_time
+            // Omitted entirely when the response contained no thinking blocks,
+            // so a missing field means "no split available", never "zero".
+            ...llmCall.thinkingEndTime ? { ls_thinking_end_time: llmCall.thinkingEndTime } : {},
             ...llmCall.synthetic ? { synthetic: true } : {}
           }
         })

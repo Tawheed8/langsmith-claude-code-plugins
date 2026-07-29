@@ -141,6 +141,13 @@ export interface LLMCall {
   startTime: string;
   /** Timestamp of last chunk (end time). */
   endTime: string;
+  /**
+   * Timestamp of the first chunk carrying visible output (text / tool_use)
+   * after at least one thinking block — i.e. the thinking→generation boundary.
+   * Undefined when the response contained no thinking blocks, or when thinking
+   * was never followed by visible output (nothing to split).
+   */
+  thinkingEndTime?: string;
   /** Tool calls made in this response. */
   toolCalls: ToolCall[];
   /** True if this LLM call was synthesized (not from the transcript). */

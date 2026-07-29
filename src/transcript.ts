@@ -240,6 +240,36 @@ export function resolveProvider(model: string): string {
 // ─── Streaming merge ────────────────────────────────────────────────────────
 
 /**
+ * Find the thinking→generation boundary: the timestamp of the first chunk that
+ * carries visible output (text / tool_use) *after* at least one thinking block.
+ *
+ * Splitting these matters for agent optimisation — long thinking and long
+ * generation call for opposite remedies (more/better context vs. reining in
+ * output), and a single blended duration cannot tell them apart.
+ *
+ * Returns undefined when there is no boundary to report: no thinking blocks at
+ * all, or thinking never followed by visible output. Callers must omit the
+ * field in that case rather than substitute a bogus timestamp.
+ *
+ * Precision note: when a single chunk carries both thinking and visible blocks,
+ * the true switch happened somewhere inside it; that chunk's timestamp is the
+ * closest boundary the transcript actually records.
+ */
+function findThinkingEndTime(chunks: AssistantMessage[]): string | undefined {
+  let sawThinking = false;
+  for (const chunk of chunks) {
+    for (const block of chunk.message.content) {
+      if (block.type === "thinking") {
+        sawThinking = true;
+      } else if (sawThinking) {
+        return chunk.timestamp;
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
  * Merge streaming assistant chunks that share the same message.id
  * into a single LLM call with concatenated text and final-chunk usage.
  */
@@ -249,6 +279,7 @@ function mergeAssistantChunks(chunks: AssistantMessage[]): {
   usage: Usage;
   startTime: string;
   endTime: string;
+  thinkingEndTime: string | undefined;
 } {
   if (chunks.length === 0) {
     throw new Error("Cannot merge zero chunks");
@@ -267,6 +298,7 @@ function mergeAssistantChunks(chunks: AssistantMessage[]): {
     usage: last.message.usage, // SSE usage is cumulative; last chunk has final totals.
     startTime: first.timestamp,
     endTime: last.timestamp,
+    thinkingEndTime: findThinkingEndTime(chunks),
   };
 }
 
@@ -384,6 +416,7 @@ export function groupIntoTurns(messages: TranscriptMessage[]): Turn[] {
         usage: merged.usage,
         startTime: merged.startTime,
         endTime: merged.endTime,
+        thinkingEndTime: merged.thinkingEndTime,
         toolCalls,
       });
     }
