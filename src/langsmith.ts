@@ -9,7 +9,16 @@
 import { Client, RunTree, RunTreeConfig, uuid7 } from "langsmith";
 import { createSecretAnonymizer } from "langsmith/anonymizer";
 import type { StringNodeRule } from "langsmith/anonymizer";
-import type { Turn, ContentBlock, Usage, LLMCall, OpenTurn, SessionState } from "./types.js";
+import type {
+  Turn,
+  ContentBlock,
+  TextBlock,
+  ThinkingBlock,
+  Usage,
+  LLMCall,
+  OpenTurn,
+  SessionState,
+} from "./types.js";
 import { readTranscript, groupIntoTurns, resolveProvider } from "./transcript.js";
 import { loadState, getSessionState } from "./state.js";
 import * as logger from "./logger.js";
@@ -181,16 +190,49 @@ async function tracePhaseSpans(opts: {
   const firstToken = llmCall.startTime;
   const thinkingEnd = llmCall.thinkingEndTime;
 
+  // Carry the content produced in each phase, so a span shows *what* happened
+  // in it and not just how long it took — the reasoning is the whole point of
+  // being able to see a long Thinking bar.
+  //
+  // Content only, never token counts: Anthropic reports a single output_tokens
+  // covering thinking and visible output together, so any per-phase token
+  // number here would be invented. Redacted/encrypted thinking simply doesn't
+  // match the block type, leaving that phase with its duration alone.
+  const thinkingText = llmCall.content
+    .filter((b): b is ThinkingBlock => b.type === "thinking")
+    .map((b) => b.thinking)
+    .join("\n\n");
+  const generatedText = llmCall.content
+    .filter((b): b is TextBlock => b.type === "text")
+    .map((b) => b.text)
+    .join("\n\n");
+
   // "Waiting" covers dispatch, queueing and prompt processing — everything
-  // before the model emitted its first token of any kind.
-  const phases: Array<{ name: string; start: string; end: string }> = [
-    { name: "Waiting (queue + prompt)", start: spanStart, end: firstToken },
-  ];
+  // before the model emitted its first token of any kind. Nothing is produced
+  // in it, so it carries no body.
+  const phases: Array<{
+    name: string;
+    start: string;
+    end: string;
+    body?: Record<string, unknown>;
+  }> = [{ name: "Waiting (queue + prompt)", start: spanStart, end: firstToken }];
+  const thinkingBody = thinkingText ? { thinking: thinkingText } : undefined;
+  const generatingBody = generatedText ? { text: generatedText } : undefined;
   if (thinkingEnd) {
-    phases.push({ name: "Thinking", start: firstToken, end: thinkingEnd });
-    phases.push({ name: "Generating", start: thinkingEnd, end: llmCall.endTime });
+    phases.push({ name: "Thinking", start: firstToken, end: thinkingEnd, body: thinkingBody });
+    phases.push({
+      name: "Generating",
+      start: thinkingEnd,
+      end: llmCall.endTime,
+      body: generatingBody,
+    });
   } else {
-    phases.push({ name: "Generating", start: firstToken, end: llmCall.endTime });
+    phases.push({
+      name: "Generating",
+      start: firstToken,
+      end: llmCall.endTime,
+      body: generatingBody,
+    });
   }
 
   for (const phase of phases) {
@@ -208,7 +250,7 @@ async function tracePhaseSpans(opts: {
       name: phase.name,
       run_type: "chain",
       inputs: {},
-      outputs: { duration_ms: ms },
+      outputs: { duration_ms: ms, ...(phase.body ?? {}) },
       project_name: project,
       start_time: phase.start,
       end_time: phase.end,

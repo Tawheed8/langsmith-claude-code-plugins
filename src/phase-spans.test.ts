@@ -78,7 +78,10 @@ describe("timing phase spans (opt-in)", () => {
       userTimestamp: "2026-07-29T07:07:34.000Z",
       llmCalls: [
         {
-          content: [{ type: "text", text: "done" }],
+          content: [
+            { type: "thinking", thinking: "weighing the options" },
+            { type: "text", text: "done" },
+          ],
           model: "claude-sonnet-4-5",
           usage: { input_tokens: 10, output_tokens: 5 },
           // Real fixture shape: 0.945s waiting, 2.262s thinking, 1.0s generating.
@@ -108,7 +111,15 @@ describe("timing phase spans (opt-in)", () => {
     expect(phases[2].start_time).toBe("2026-07-29T07:07:37.207Z");
     expect(phases[2].end_time).toBe("2026-07-29T07:07:38.207Z"); // span end
 
-    expect(phases[1].outputs).toEqual({ duration_ms: 2262 });
+    // Each phase carries what was produced in it, not just its duration —
+    // a long Thinking bar is only actionable if you can read the reasoning.
+    expect(phases[1].outputs).toEqual({
+      duration_ms: 2262,
+      thinking: "weighing the options",
+    });
+    expect(phases[2].outputs).toEqual({ duration_ms: 1000, text: "done" });
+    // Waiting produces nothing, so it stays duration-only.
+    expect(phases[0].outputs).toEqual({ duration_ms: 945 });
 
     // Timing annotations only — must not add tokens/cost to trace rollups.
     for (const p of phases) {

@@ -12601,14 +12601,26 @@ async function tracePhaseSpans(opts) {
   const { llmCall, spanStart, parentRunId, parentDottedOrder, traceId, project, metadata } = opts;
   const firstToken = llmCall.startTime;
   const thinkingEnd = llmCall.thinkingEndTime;
-  const phases = [
-    { name: "Waiting (queue + prompt)", start: spanStart, end: firstToken }
-  ];
+  const thinkingText = llmCall.content.filter((b) => b.type === "thinking").map((b) => b.thinking).join("\n\n");
+  const generatedText = llmCall.content.filter((b) => b.type === "text").map((b) => b.text).join("\n\n");
+  const phases = [{ name: "Waiting (queue + prompt)", start: spanStart, end: firstToken }];
+  const thinkingBody = thinkingText ? { thinking: thinkingText } : void 0;
+  const generatingBody = generatedText ? { text: generatedText } : void 0;
   if (thinkingEnd) {
-    phases.push({ name: "Thinking", start: firstToken, end: thinkingEnd });
-    phases.push({ name: "Generating", start: thinkingEnd, end: llmCall.endTime });
+    phases.push({ name: "Thinking", start: firstToken, end: thinkingEnd, body: thinkingBody });
+    phases.push({
+      name: "Generating",
+      start: thinkingEnd,
+      end: llmCall.endTime,
+      body: generatingBody
+    });
   } else {
-    phases.push({ name: "Generating", start: firstToken, end: llmCall.endTime });
+    phases.push({
+      name: "Generating",
+      start: firstToken,
+      end: llmCall.endTime,
+      body: generatingBody
+    });
   }
   for (const phase of phases) {
     const ms = new Date(phase.end).getTime() - new Date(phase.start).getTime();
@@ -12622,7 +12634,7 @@ async function tracePhaseSpans(opts) {
       name: phase.name,
       run_type: "chain",
       inputs: {},
-      outputs: { duration_ms: ms },
+      outputs: { duration_ms: ms, ...phase.body ?? {} },
       project_name: project,
       start_time: phase.start,
       end_time: phase.end,
