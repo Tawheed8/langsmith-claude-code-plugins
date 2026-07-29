@@ -9,7 +9,7 @@
 import { Client, RunTree, RunTreeConfig, uuid7 } from "langsmith";
 import { createSecretAnonymizer } from "langsmith/anonymizer";
 import type { StringNodeRule } from "langsmith/anonymizer";
-import type { Turn, ContentBlock, Usage, OpenTurn, SessionState } from "./types.js";
+import type { Turn, ContentBlock, Usage, LLMCall, OpenTurn, SessionState } from "./types.js";
 import { readTranscript, groupIntoTurns, resolveProvider } from "./transcript.js";
 import { loadState, getSessionState } from "./state.js";
 import * as logger from "./logger.js";
@@ -141,6 +141,84 @@ function buildUsageMetadata(usage: Usage) {
       cache_creation: usage.cache_creation_input_tokens ?? 0,
     },
   };
+}
+
+// ─── Timing phase spans ─────────────────────────────────────────────────────
+
+/**
+ * Emit the phases inside one LLM response as child runs, so the waterfall shows
+ * where the time actually went instead of leaving it to metadata subtraction.
+ *
+ * The phases answer different optimisation questions, which is why they are
+ * worth separating: a long "Thinking" block means the model is straining to
+ * work out what to do (give it better context or worked examples), while a long
+ * "Generating" block just means it is emitting a lot (check that verbosity is
+ * intended). Blended into one duration, neither is actionable.
+ *
+ * These are `chain` runs carrying no usage_metadata, so they add no tokens or
+ * cost to the trace's rollups — they are purely timing annotations.
+ *
+ * Opt-in via CC_LANGSMITH_PHASE_SPANS=true. Off by default because it adds two
+ * to three rows per LLM call, which is a lot of extra rows to impose on a trace
+ * when the same numbers are already derivable from the ls_first_token_time /
+ * ls_thinking_end_time metadata on the span itself.
+ */
+const PHASE_SPANS_ENABLED =
+  (process.env.CC_LANGSMITH_PHASE_SPANS ?? "false").toLowerCase() === "true";
+
+async function tracePhaseSpans(opts: {
+  llmCall: LLMCall;
+  spanStart: string;
+  parentRunId: string;
+  parentDottedOrder: string;
+  traceId: string | undefined;
+  project: string;
+  metadata: Record<string, unknown>;
+}): Promise<void> {
+  if (!PHASE_SPANS_ENABLED) return;
+
+  const { llmCall, spanStart, parentRunId, parentDottedOrder, traceId, project, metadata } = opts;
+  const firstToken = llmCall.startTime;
+  const thinkingEnd = llmCall.thinkingEndTime;
+
+  // "Waiting" covers dispatch, queueing and prompt processing — everything
+  // before the model emitted its first token of any kind.
+  const phases: Array<{ name: string; start: string; end: string }> = [
+    { name: "Waiting (queue + prompt)", start: spanStart, end: firstToken },
+  ];
+  if (thinkingEnd) {
+    phases.push({ name: "Thinking", start: firstToken, end: thinkingEnd });
+    phases.push({ name: "Generating", start: thinkingEnd, end: llmCall.endTime });
+  } else {
+    phases.push({ name: "Generating", start: firstToken, end: llmCall.endTime });
+  }
+
+  for (const phase of phases) {
+    const ms = new Date(phase.end).getTime() - new Date(phase.start).getTime();
+    // Skip empty phases. A single-chunk response has no measurable generation
+    // window (only one timestamp exists), and clock skew can invert a boundary;
+    // emitting a zero/negative bar would imply a measurement that wasn't made.
+    if (!(ms > 0)) continue;
+
+    const phaseRunId = uuid7();
+    const runTree = new RunTree({
+      client,
+      replicas,
+      id: phaseRunId,
+      name: phase.name,
+      run_type: "chain",
+      inputs: {},
+      outputs: { duration_ms: ms },
+      project_name: project,
+      start_time: phase.start,
+      end_time: phase.end,
+      parent_run_id: parentRunId,
+      trace_id: traceId,
+      dotted_order: `${parentDottedOrder}.${generateDottedOrderSegment(phase.start, phaseRunId)}`,
+      extra: { metadata },
+    });
+    await runTree.postRun();
+  }
 }
 
 // ─── Run creation ───────────────────────────────────────────────────────────
@@ -444,6 +522,25 @@ export async function traceTurn(
     });
 
     await runTree.patchRun({ excludeInputs: true });
+
+    // Break the span into waiting / thinking / generating child runs so the
+    // split is readable straight off the waterfall.
+    await tracePhaseSpans({
+      llmCall,
+      spanStart: llmStartBoundary,
+      parentRunId: assistantRunId,
+      parentDottedOrder: assistantDottedOrder,
+      traceId,
+      project,
+      metadata: codingAgentMetadata({
+        sessionId,
+        base: customMetadata,
+        turnId,
+        turnNumber: turnNum,
+        runtimeVersion,
+        agentType,
+      }),
+    });
 
     // Accumulate context for next LLM call.
     accumulatedMessages.push({ role: "assistant", content: assistantContent });

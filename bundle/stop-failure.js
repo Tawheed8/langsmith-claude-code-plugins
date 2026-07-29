@@ -12299,6 +12299,7 @@ async function flushPendingTraces() {
   ]);
   debug("Trace batches flushed successfully");
 }
+var PHASE_SPANS_ENABLED = (process.env.CC_LANGSMITH_PHASE_SPANS ?? "false").toLowerCase() === "true";
 
 // dist/config.js
 import { readFileSync as readFileSync5 } from "node:fs";

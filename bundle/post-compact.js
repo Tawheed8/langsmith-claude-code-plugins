@@ -12307,6 +12307,7 @@ function generateDottedOrderSegment(time, runId) {
   const stripped = isoWithMicroseconds.replace(/[-:.]/g, "");
   return stripped + runId;
 }
+var PHASE_SPANS_ENABLED = (process.env.CC_LANGSMITH_PHASE_SPANS ?? "false").toLowerCase() === "true";
 
 // dist/config.js
 import { readFileSync as readFileSync5 } from "node:fs";

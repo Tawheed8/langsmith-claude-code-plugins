@@ -12624,6 +12624,46 @@ function buildUsageMetadata(usage) {
     }
   };
 }
+var PHASE_SPANS_ENABLED = (process.env.CC_LANGSMITH_PHASE_SPANS ?? "false").toLowerCase() === "true";
+async function tracePhaseSpans(opts) {
+  if (!PHASE_SPANS_ENABLED)
+    return;
+  const { llmCall, spanStart, parentRunId, parentDottedOrder, traceId, project, metadata } = opts;
+  const firstToken = llmCall.startTime;
+  const thinkingEnd = llmCall.thinkingEndTime;
+  const phases = [
+    { name: "Waiting (queue + prompt)", start: spanStart, end: firstToken }
+  ];
+  if (thinkingEnd) {
+    phases.push({ name: "Thinking", start: firstToken, end: thinkingEnd });
+    phases.push({ name: "Generating", start: thinkingEnd, end: llmCall.endTime });
+  } else {
+    phases.push({ name: "Generating", start: firstToken, end: llmCall.endTime });
+  }
+  for (const phase of phases) {
+    const ms = new Date(phase.end).getTime() - new Date(phase.start).getTime();
+    if (!(ms > 0))
+      continue;
+    const phaseRunId = uuid7();
+    const runTree = new RunTree({
+      client,
+      replicas,
+      id: phaseRunId,
+      name: phase.name,
+      run_type: "chain",
+      inputs: {},
+      outputs: { duration_ms: ms },
+      project_name: project,
+      start_time: phase.start,
+      end_time: phase.end,
+      parent_run_id: parentRunId,
+      trace_id: traceId,
+      dotted_order: `${parentDottedOrder}.${generateDottedOrderSegment(phase.start, phaseRunId)}`,
+      extra: { metadata }
+    });
+    await runTree.postRun();
+  }
+}
 async function traceTurn(options) {
   const { turn, sessionId, turnNum, project, parentRunId, existingTaskRunMap, tracedToolUseIds, traceId: providedTraceId, parentDottedOrder: providedParentDottedOrder, customMetadata, runtimeVersion, approvalPolicy, agentType = "root" } = options;
   const turnId = turn.promptId;
@@ -12802,6 +12842,22 @@ async function traceTurn(options) {
       }
     });
     await runTree.patchRun({ excludeInputs: true });
+    await tracePhaseSpans({
+      llmCall,
+      spanStart: llmStartBoundary,
+      parentRunId: assistantRunId,
+      parentDottedOrder: assistantDottedOrder,
+      traceId,
+      project,
+      metadata: codingAgentMetadata({
+        sessionId,
+        base: customMetadata,
+        turnId,
+        turnNumber: turnNum,
+        runtimeVersion,
+        agentType
+      })
+    });
     accumulatedMessages.push({ role: "assistant", content: assistantContent });
     for (const tc of llmCall.toolCalls) {
       accumulatedMessages.push({
