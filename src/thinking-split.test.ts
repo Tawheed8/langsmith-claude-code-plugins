@@ -1,28 +1,23 @@
 /**
  * Thinking→generation boundary extraction.
  *
- * Fixtures are lifted verbatim from a real Claude Code transcript (message ids
- * and timestamps unchanged), which showed thinking blocks arriving in their own
- * streamed chunk, separate from the chunk carrying visible output:
+ * A chunk's timestamp is when that content block *completed*. Verified against
+ * real traces: the gap between a thinking chunk and the next visible chunk
+ * tracks the size of the visible block (68 chars → 0.014s, 3572 chars →
+ * 12.282s, ~290 chars/s), i.e. it measures generation throughput, not
+ * deliberation. So the last thinking block's timestamp marks where thinking
+ * ended and generation began.
  *
- *   yDQwzuQc  thinking 07:07:34.945 → tool_use 07:07:37.207   (2.26s thinking)
- *   H7S67Txt  thinking 07:08:08.309 → tool_use 07:08:13.110   (4.80s thinking)
+ * Fixtures use real transcript timestamps:
+ *   yDQwzuQc  thinking 07:07:34.945 → tool_use 07:07:37.207   (2.262s generating)
  *   i8A59FoH  text     07:07:12.128 → tool_use 07:07:12.258   (no thinking)
- *
- * That separation is what makes the split recoverable at all; if a future
- * Claude Code version collapses thinking and output into one chunk, these
- * assertions are the early warning.
  */
 import { describe, it, expect } from "vitest";
 import { groupIntoTurns } from "./transcript.js";
 import type { TranscriptMessage, AssistantMessage } from "./types.js";
 
 function userMsg(timestamp: string): TranscriptMessage {
-  return {
-    type: "user",
-    message: { role: "user", content: "go" },
-    timestamp,
-  } as TranscriptMessage;
+  return { type: "user", message: { role: "user", content: "go" }, timestamp } as TranscriptMessage;
 }
 
 function chunk(
@@ -46,12 +41,11 @@ function chunk(
 }
 
 describe("thinking→generation boundary", () => {
-  it("reports the boundary when thinking precedes visible output (real fixture)", () => {
+  it("marks where thinking ended, so the remainder is generation (real fixture)", () => {
     const messages: TranscriptMessage[] = [
       userMsg("2026-07-29T07:07:34.000Z"),
-      chunk("yDQwzuQc", "2026-07-29T07:07:34.945Z", [
-        { type: "thinking", thinking: "deciding which tool to use" },
-      ]),
+      // Empty text is how Claude Code actually persists thinking blocks.
+      chunk("yDQwzuQc", "2026-07-29T07:07:34.945Z", [{ type: "thinking", thinking: "" }]),
       chunk(
         "yDQwzuQc",
         "2026-07-29T07:07:37.207Z",
@@ -60,38 +54,33 @@ describe("thinking→generation boundary", () => {
       ),
     ];
 
-    const [turn] = groupIntoTurns(messages);
-    const call = turn.llmCalls[0];
+    const call = groupIntoTurns(messages)[0].llmCalls[0];
 
-    // Span still spans the whole response...
-    expect(call.startTime).toBe("2026-07-29T07:07:34.945Z");
-    expect(call.endTime).toBe("2026-07-29T07:07:37.207Z");
-    // ...and the boundary isolates the 2.26s that was thinking.
-    expect(call.thinkingEndTime).toBe("2026-07-29T07:07:37.207Z");
+    // Boundary is the thinking block's own completion, NOT the later visible
+    // chunk — that later gap is time spent generating the tool call.
+    expect(call.thinkingEndTime).toBe("2026-07-29T07:07:34.945Z");
 
-    const thinkingMs =
-      new Date(call.thinkingEndTime!).getTime() - new Date(call.startTime).getTime();
-    expect(thinkingMs).toBe(2262);
+    const generatingMs =
+      new Date(call.endTime).getTime() - new Date(call.thinkingEndTime!).getTime();
+    expect(generatingMs).toBe(2262);
   });
 
-  it("isolates a longer thinking stretch (real fixture)", () => {
+  it("uses the last thinking block when several precede the output", () => {
     const messages: TranscriptMessage[] = [
-      userMsg("2026-07-29T07:08:08.000Z"),
-      chunk("H7S67Txt", "2026-07-29T07:08:08.309Z", [
-        { type: "thinking", thinking: "working out the expression" },
-      ]),
+      userMsg("2026-07-29T07:09:00.000Z"),
+      chunk("Multi", "2026-07-29T07:09:01.000Z", [{ type: "thinking", thinking: "" }]),
+      chunk("Multi", "2026-07-29T07:09:03.500Z", [{ type: "thinking", thinking: "" }]),
       chunk(
-        "H7S67Txt",
-        "2026-07-29T07:08:13.110Z",
-        [{ type: "tool_use", id: "t2", name: "Bash", input: {} }],
+        "Multi",
+        "2026-07-29T07:09:05.000Z",
+        [{ type: "text", text: "answer" }],
         "end_turn",
       ),
     ];
 
     const call = groupIntoTurns(messages)[0].llmCalls[0];
-    const thinkingMs =
-      new Date(call.thinkingEndTime!).getTime() - new Date(call.startTime).getTime();
-    expect(thinkingMs).toBe(4801);
+    // Thinking ran until 03.500; only the final 1.5s was generating.
+    expect(call.thinkingEndTime).toBe("2026-07-29T07:09:03.500Z");
   });
 
   it("omits the boundary entirely when the response had no thinking (real fixture)", () => {
@@ -107,35 +96,34 @@ describe("thinking→generation boundary", () => {
     ];
 
     const call = groupIntoTurns(messages)[0].llmCalls[0];
-    // Undefined, never a fabricated value — a missing field must read as
-    // "no split available", not "zero thinking".
+    // Undefined, never fabricated — means "no split available", not "zero".
     expect(call.thinkingEndTime).toBeUndefined();
   });
 
-  it("does not treat thinking that never reached visible output as a boundary", () => {
+  it("does not report a boundary when thinking never reached visible output", () => {
     const messages: TranscriptMessage[] = [
       userMsg("2026-07-29T07:09:00.000Z"),
       chunk(
         "OnlyThink",
         "2026-07-29T07:09:01.000Z",
-        [{ type: "thinking", thinking: "interrupted mid-thought" }],
+        [{ type: "thinking", thinking: "" }],
         "end_turn",
       ),
     ];
 
-    const call = groupIntoTurns(messages)[0].llmCalls[0];
-    expect(call.thinkingEndTime).toBeUndefined();
+    expect(groupIntoTurns(messages)[0].llmCalls[0].thinkingEndTime).toBeUndefined();
   });
 
-  it("uses the chunk timestamp when thinking and output share one chunk", () => {
-    // Closest boundary the transcript records — the true switch is inside it.
+  it("collapses the generation window when one chunk holds thinking and output", () => {
+    // The switch happened inside the chunk; only its timestamp is recorded, so
+    // generation is unmeasurable (zero) rather than guessed at.
     const messages: TranscriptMessage[] = [
       userMsg("2026-07-29T07:10:00.000Z"),
       chunk(
         "Mixed",
         "2026-07-29T07:10:02.500Z",
         [
-          { type: "thinking", thinking: "brief" },
+          { type: "thinking", thinking: "" },
           { type: "text", text: "answer" },
         ],
         "end_turn",
@@ -144,5 +132,6 @@ describe("thinking→generation boundary", () => {
 
     const call = groupIntoTurns(messages)[0].llmCalls[0];
     expect(call.thinkingEndTime).toBe("2026-07-29T07:10:02.500Z");
+    expect(new Date(call.endTime).getTime() - new Date(call.thinkingEndTime!).getTime()).toBe(0);
   });
 });

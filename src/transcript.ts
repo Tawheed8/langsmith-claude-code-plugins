@@ -240,33 +240,41 @@ export function resolveProvider(model: string): string {
 // ─── Streaming merge ────────────────────────────────────────────────────────
 
 /**
- * Find the thinking→generation boundary: the timestamp of the first chunk that
- * carries visible output (text / tool_use) *after* at least one thinking block.
+ * Find the thinking→generation boundary: the timestamp of the *last* chunk
+ * carrying a thinking block, provided visible output (text / tool_use) follows.
  *
- * Splitting these matters for agent optimisation — long thinking and long
- * generation call for opposite remedies (more/better context vs. reining in
- * output), and a single blended duration cannot tell them apart.
+ * A chunk's timestamp is when that content block *completed*, not when it
+ * started. Verified against real traces: the interval between a thinking chunk
+ * and the next visible chunk tracks the size of the visible block almost
+ * linearly (68 chars → 0.014s, 3572 chars → 12.282s, ~290 chars/s), which is
+ * generation throughput, not deliberation. So the last thinking block's
+ * timestamp is the moment thinking finished and output generation began.
  *
- * Returns undefined when there is no boundary to report: no thinking blocks at
- * all, or thinking never followed by visible output. Callers must omit the
- * field in that case rather than substitute a bogus timestamp.
+ * Consequence worth knowing: thinking itself cannot be isolated. It completes
+ * somewhere inside [request start, this timestamp], alongside queueing and
+ * prompt processing, and Claude Code persists thinking blocks with empty text
+ * ({"type":"thinking","thinking":""}), so there is no content or second marker
+ * to narrow it further.
  *
- * Precision note: when a single chunk carries both thinking and visible blocks,
- * the true switch happened somewhere inside it; that chunk's timestamp is the
- * closest boundary the transcript actually records.
+ * Returns undefined when there is no boundary: no thinking blocks, or thinking
+ * never followed by visible output. Callers must omit the field rather than
+ * substitute a bogus timestamp.
  */
 function findThinkingEndTime(chunks: AssistantMessage[]): string | undefined {
-  let sawThinking = false;
+  let lastThinkingTs: string | undefined;
+  let visibleFollows = false;
   for (const chunk of chunks) {
-    for (const block of chunk.message.content) {
-      if (block.type === "thinking") {
-        sawThinking = true;
-      } else if (sawThinking) {
-        return chunk.timestamp;
-      }
+    const hasThinking = chunk.message.content.some((b) => b.type === "thinking");
+    const hasVisible = chunk.message.content.some((b) => b.type !== "thinking");
+    if (lastThinkingTs && hasVisible) visibleFollows = true;
+    if (hasThinking) {
+      lastThinkingTs = chunk.timestamp;
+      // Both in one chunk: the switch happened inside it, so the boundary is
+      // this timestamp and the generation window is unmeasurable (zero).
+      if (hasVisible) visibleFollows = true;
     }
   }
-  return undefined;
+  return lastThinkingTs && visibleFollows ? lastThinkingTs : undefined;
 }
 
 /**

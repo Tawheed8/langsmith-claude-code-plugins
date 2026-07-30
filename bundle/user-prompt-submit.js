@@ -12344,17 +12344,20 @@ function resolveProvider(model) {
   return /^([a-z0-9-]+\.)?anthropic\.claude/.test(model) ? "amazon_bedrock" : "anthropic";
 }
 function findThinkingEndTime(chunks) {
-  let sawThinking = false;
+  let lastThinkingTs;
+  let visibleFollows = false;
   for (const chunk of chunks) {
-    for (const block of chunk.message.content) {
-      if (block.type === "thinking") {
-        sawThinking = true;
-      } else if (sawThinking) {
-        return chunk.timestamp;
-      }
+    const hasThinking = chunk.message.content.some((b) => b.type === "thinking");
+    const hasVisible = chunk.message.content.some((b) => b.type !== "thinking");
+    if (lastThinkingTs && hasVisible)
+      visibleFollows = true;
+    if (hasThinking) {
+      lastThinkingTs = chunk.timestamp;
+      if (hasVisible)
+        visibleFollows = true;
     }
   }
-  return void 0;
+  return lastThinkingTs && visibleFollows ? lastThinkingTs : void 0;
 }
 function mergeAssistantChunks(chunks) {
   if (chunks.length === 0) {
@@ -12680,13 +12683,11 @@ async function tracePhaseSpans(opts) {
   const { llmCall, spanStart, parentRunId, parentDottedOrder, traceId, project, metadata } = opts;
   const firstToken = llmCall.startTime;
   const thinkingEnd = llmCall.thinkingEndTime;
-  const thinkingText = llmCall.content.filter((b) => b.type === "thinking").map((b) => b.thinking).join("\n\n");
   const generatedText = llmCall.content.filter((b) => b.type === "text").map((b) => b.text).join("\n\n");
-  const phases = [{ name: "Waiting (queue + prompt)", start: spanStart, end: firstToken }];
-  const thinkingBody = thinkingText ? { thinking: thinkingText } : void 0;
   const generatingBody = generatedText ? { text: generatedText } : void 0;
+  const phases = [];
   if (thinkingEnd) {
-    phases.push({ name: "Thinking", start: firstToken, end: thinkingEnd, body: thinkingBody });
+    phases.push({ name: "Queue + prompt + thinking", start: spanStart, end: thinkingEnd });
     phases.push({
       name: "Generating",
       start: thinkingEnd,
@@ -12694,6 +12695,7 @@ async function tracePhaseSpans(opts) {
       body: generatingBody
     });
   } else {
+    phases.push({ name: "Queue + prompt", start: spanStart, end: firstToken });
     phases.push({
       name: "Generating",
       start: firstToken,
@@ -12885,17 +12887,19 @@ async function traceTurn(options) {
               model: llmCall.model
             },
             usage_metadata: buildUsageMetadata(llmCall.usage),
-            // First streamed token, preserved now that it no longer drives
-            // start_time. Marks the end of pre-token latency (dispatch,
-            // queueing, prompt processing) and the start of model output.
+            // Completion time of the response's first content block, preserved
+            // now that it no longer drives start_time.
             ls_first_token_time: llmCall.startTime,
-            // Thinking→generation boundary, when the response had one. Together
-            // with the two fields above this yields a three-way split:
-            //   pre-token  = ls_first_token_time - start_time
-            //   thinking   = ls_thinking_end_time - ls_first_token_time
-            //   generation = end_time - ls_thinking_end_time
-            // Omitted entirely when the response contained no thinking blocks,
-            // so a missing field means "no split available", never "zero".
+            // Completion time of the last thinking block — the moment output
+            // generation began. Gives a two-way split:
+            //   queue + prompt + thinking = ls_thinking_end_time - start_time
+            //   generating                = end_time - ls_thinking_end_time
+            // Thinking is NOT separable from queueing and prompt processing:
+            // block timestamps are completion times, so the first marker
+            // already has thinking behind it, and Claude Code stores thinking
+            // blocks with empty text. Omitted when the response had no thinking
+            // blocks, so a missing field means "no split available", never
+            // "zero thinking".
             ...llmCall.thinkingEndTime ? { ls_thinking_end_time: llmCall.thinkingEndTime } : {},
             ...llmCall.synthetic ? { synthetic: true } : {}
           }

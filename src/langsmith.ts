@@ -13,7 +13,6 @@ import type {
   Turn,
   ContentBlock,
   TextBlock,
-  ThinkingBlock,
   Usage,
   LLMCall,
   OpenTurn,
@@ -190,36 +189,33 @@ async function tracePhaseSpans(opts: {
   const firstToken = llmCall.startTime;
   const thinkingEnd = llmCall.thinkingEndTime;
 
-  // Carry the content produced in each phase, so a span shows *what* happened
-  // in it and not just how long it took — the reasoning is the whole point of
-  // being able to see a long Thinking bar.
+  // Visible text produced in the generating phase, so the bar shows *what* was
+  // emitted and not just how long it took. Thinking carries no body: Claude
+  // Code persists thinking blocks with empty text, so there is nothing to show.
   //
-  // Content only, never token counts: Anthropic reports a single output_tokens
-  // covering thinking and visible output together, so any per-phase token
-  // number here would be invented. Redacted/encrypted thinking simply doesn't
-  // match the block type, leaving that phase with its duration alone.
-  const thinkingText = llmCall.content
-    .filter((b): b is ThinkingBlock => b.type === "thinking")
-    .map((b) => b.thinking)
-    .join("\n\n");
+  // Content only, never token counts — Anthropic reports a single output_tokens
+  // covering thinking and visible output together, so a per-phase token number
+  // would be invented.
   const generatedText = llmCall.content
     .filter((b): b is TextBlock => b.type === "text")
     .map((b) => b.text)
     .join("\n\n");
+  const generatingBody = generatedText ? { text: generatedText } : undefined;
 
-  // "Waiting" covers dispatch, queueing and prompt processing — everything
-  // before the model emitted its first token of any kind. Nothing is produced
-  // in it, so it carries no body.
+  // Chunk timestamps are block *completion* times, so the first measurable
+  // marker already has thinking behind it. That makes the pre-output bucket
+  // irreducible: queueing, prompt processing and thinking share one interval
+  // and cannot be told apart. It is named for everything it contains rather
+  // than for one part of it — calling it "Thinking" would overstate, and
+  // attributing it to queueing alone would hide the reasoning cost.
   const phases: Array<{
     name: string;
     start: string;
     end: string;
     body?: Record<string, unknown>;
-  }> = [{ name: "Waiting (queue + prompt)", start: spanStart, end: firstToken }];
-  const thinkingBody = thinkingText ? { thinking: thinkingText } : undefined;
-  const generatingBody = generatedText ? { text: generatedText } : undefined;
+  }> = [];
   if (thinkingEnd) {
-    phases.push({ name: "Thinking", start: firstToken, end: thinkingEnd, body: thinkingBody });
+    phases.push({ name: "Queue + prompt + thinking", start: spanStart, end: thinkingEnd });
     phases.push({
       name: "Generating",
       start: thinkingEnd,
@@ -227,6 +223,10 @@ async function tracePhaseSpans(opts: {
       body: generatingBody,
     });
   } else {
+    // No thinking block: the first chunk completing is the first visible block,
+    // so this bucket also contains generating that block. Still the tightest
+    // upper bound available on queue + prompt time.
+    phases.push({ name: "Queue + prompt", start: spanStart, end: firstToken });
     phases.push({
       name: "Generating",
       start: firstToken,
@@ -543,17 +543,19 @@ export async function traceTurn(
               model: llmCall.model,
             },
             usage_metadata: buildUsageMetadata(llmCall.usage),
-            // First streamed token, preserved now that it no longer drives
-            // start_time. Marks the end of pre-token latency (dispatch,
-            // queueing, prompt processing) and the start of model output.
+            // Completion time of the response's first content block, preserved
+            // now that it no longer drives start_time.
             ls_first_token_time: llmCall.startTime,
-            // Thinking→generation boundary, when the response had one. Together
-            // with the two fields above this yields a three-way split:
-            //   pre-token  = ls_first_token_time - start_time
-            //   thinking   = ls_thinking_end_time - ls_first_token_time
-            //   generation = end_time - ls_thinking_end_time
-            // Omitted entirely when the response contained no thinking blocks,
-            // so a missing field means "no split available", never "zero".
+            // Completion time of the last thinking block — the moment output
+            // generation began. Gives a two-way split:
+            //   queue + prompt + thinking = ls_thinking_end_time - start_time
+            //   generating                = end_time - ls_thinking_end_time
+            // Thinking is NOT separable from queueing and prompt processing:
+            // block timestamps are completion times, so the first marker
+            // already has thinking behind it, and Claude Code stores thinking
+            // blocks with empty text. Omitted when the response had no thinking
+            // blocks, so a missing field means "no split available", never
+            // "zero thinking".
             ...(llmCall.thinkingEndTime
               ? { ls_thinking_end_time: llmCall.thinkingEndTime }
               : {}),

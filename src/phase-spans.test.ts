@@ -72,22 +72,21 @@ describe("timing phase spans (opt-in)", () => {
     initTracing("test-api-key", "https://test.api.com");
   });
 
-  it("splits a thinking response into waiting / thinking / generating", async () => {
+  it("splits a thinking response into pre-output and generating", async () => {
     const turn: Turn = {
       userContent: "go",
       userTimestamp: "2026-07-29T07:07:34.000Z",
       llmCalls: [
         {
           content: [
-            { type: "thinking", thinking: "weighing the options" },
+            { type: "thinking", thinking: "" },
             { type: "text", text: "done" },
           ],
           model: "claude-sonnet-4-5",
           usage: { input_tokens: 10, output_tokens: 5 },
-          // Real fixture shape: 0.945s waiting, 2.262s thinking, 1.0s generating.
           startTime: "2026-07-29T07:07:34.945Z",
-          thinkingEndTime: "2026-07-29T07:07:37.207Z",
-          endTime: "2026-07-29T07:07:38.207Z",
+          thinkingEndTime: "2026-07-29T07:07:34.945Z",
+          endTime: "2026-07-29T07:07:37.207Z",
           toolCalls: [],
         },
       ],
@@ -97,29 +96,18 @@ describe("timing phase spans (opt-in)", () => {
     await traceTurn({ turn, sessionId: "s", turnNum: 1, project: "p" });
 
     const phases = phaseRuns();
-    expect(phases.map((p) => p.name)).toEqual([
-      "Waiting (queue + prompt)",
-      "Thinking",
-      "Generating",
-    ]);
+    expect(phases.map((p) => p.name)).toEqual(["Queue + prompt + thinking", "Generating"]);
 
     // Phases tile the span exactly: no gaps, no overlaps.
     expect(phases[0].start_time).toBe("2026-07-29T07:07:34.000Z"); // span start
-    expect(phases[0].end_time).toBe("2026-07-29T07:07:34.945Z"); // first token
+    expect(phases[0].end_time).toBe("2026-07-29T07:07:34.945Z"); // thinking done
     expect(phases[1].start_time).toBe("2026-07-29T07:07:34.945Z");
-    expect(phases[1].end_time).toBe("2026-07-29T07:07:37.207Z"); // thinking end
-    expect(phases[2].start_time).toBe("2026-07-29T07:07:37.207Z");
-    expect(phases[2].end_time).toBe("2026-07-29T07:07:38.207Z"); // span end
+    expect(phases[1].end_time).toBe("2026-07-29T07:07:37.207Z"); // span end
 
-    // Each phase carries what was produced in it, not just its duration —
-    // a long Thinking bar is only actionable if you can read the reasoning.
-    expect(phases[1].outputs).toEqual({
-      duration_ms: 2262,
-      thinking: "weighing the options",
-    });
-    expect(phases[2].outputs).toEqual({ duration_ms: 1000, text: "done" });
-    // Waiting produces nothing, so it stays duration-only.
+    // Generating carries what was emitted; the pre-output bucket has no body
+    // because Claude Code persists thinking blocks with empty text.
     expect(phases[0].outputs).toEqual({ duration_ms: 945 });
+    expect(phases[1].outputs).toEqual({ duration_ms: 2262, text: "done" });
 
     // Timing annotations only — must not add tokens/cost to trace rollups.
     for (const p of phases) {
@@ -130,7 +118,7 @@ describe("timing phase spans (opt-in)", () => {
     }
   });
 
-  it("emits no Thinking phase when the response had no thinking", async () => {
+  it("labels the bucket without thinking when the response had none", async () => {
     const turn: Turn = {
       userContent: "go",
       userTimestamp: "2026-07-29T07:07:12.000Z",
@@ -149,15 +137,11 @@ describe("timing phase spans (opt-in)", () => {
 
     await traceTurn({ turn, sessionId: "s", turnNum: 1, project: "p" });
 
-    expect(phaseRuns().map((p) => p.name)).toEqual([
-      "Waiting (queue + prompt)",
-      "Generating",
-    ]);
+    expect(phaseRuns().map((p) => p.name)).toEqual(["Queue + prompt", "Generating"]);
   });
 
   it("skips zero-length phases rather than drawing an empty bar", async () => {
-    // Single-chunk response: start == end, so generating has no measurable
-    // window. Emitting a 0ms bar would imply a measurement never taken.
+    // Thinking and output in one chunk: no measurable generation window.
     const turn: Turn = {
       userContent: "go",
       userTimestamp: "2026-07-29T07:07:34.000Z",
@@ -166,7 +150,7 @@ describe("timing phase spans (opt-in)", () => {
           content: [{ type: "tool_use", id: "t", name: "Bash", input: {} }],
           model: "claude-sonnet-4-5",
           usage: { input_tokens: 10, output_tokens: 5 },
-          startTime: "2026-07-29T07:07:34.945Z",
+          startTime: "2026-07-29T07:07:37.207Z",
           thinkingEndTime: "2026-07-29T07:07:37.207Z",
           endTime: "2026-07-29T07:07:37.207Z",
           toolCalls: [],
@@ -178,7 +162,7 @@ describe("timing phase spans (opt-in)", () => {
     await traceTurn({ turn, sessionId: "s", turnNum: 1, project: "p" });
 
     const names = phaseRuns().map((p) => p.name);
-    expect(names).toContain("Thinking");
+    expect(names).toContain("Queue + prompt + thinking");
     expect(names).not.toContain("Generating");
   });
 });
